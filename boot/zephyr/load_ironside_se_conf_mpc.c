@@ -27,12 +27,27 @@ BUILD_ASSERT(MCUBOOT_IMAGE_NUMBER <= 4,
 #define ACCESSIBLE_MRAM_START PARTITION_NODE_ADDRESS(DT_CHOSEN(zephyr_code_partition))
 
 #if DT_NODE_HAS_STATUS_OKAY(DT_NODELABEL(secure_storage_partition))
+/* On nRF92 the end of MRAM is NOT the application's to use: per the Saana MRAM_11
+ * allocation, everything from 0x0E52F000 up is Soft SIM storage and Cellular firmware,
+ * storage and filesystem. Requiring secure storage to end at the end of MRAM, as the
+ * nRF54H20 assertion below does, therefore places it inside the Cellular filesystem.
+ * IronSide SE accepts that without complaint and it then corrupts, so the requirement has
+ * to be dropped rather than satisfied.
+ *
+ * What the override tables actually need is only that secure storage sits above the write
+ * protected bootloader region, so that the R_X and RW ranges below it are well formed. That
+ * is asserted further down, where BOOT_PARTITION_END exists. The MRAM above secure storage
+ * keeps whatever IronSide SE granted it -- on this part that is override 5, which these
+ * tables deliberately leave alone.
+ */
+#if !defined(CONFIG_SOC_SERIES_NRF92)
 BUILD_ASSERT((PARTITION_ADDRESS(secure_storage_partition) +
 	      PARTITION_SIZE(secure_storage_partition)) ==
 		     (DT_REG_ADDR(DT_NODELABEL(mram1x)) + DT_REG_SIZE(DT_NODELABEL(mram1x))),
 	     "The MPC override configuration used to provide write protection for the image "
 	     "partitions currently requires that the secure storage partitions are placed at the "
 	     "end of MRAM.");
+#endif
 
 #define ACCESSIBLE_MRAM_END PARTITION_ADDRESS(secure_storage_partition)
 #else
@@ -246,6 +261,12 @@ BUILD_ASSERT((PARTITION_ADDRESS(secure_storage_partition) +
 CHECK_MPC_ADDRESS_ALIGNMENT("Bootloader partition", ACCESSIBLE_MRAM_START);
 CHECK_MPC_ADDRESS_ALIGNMENT("MRAM end / secure storage", ACCESSIBLE_MRAM_END);
 CHECK_MPC_ADDRESS_ALIGNMENT("Bootloader partition", BOOT_PARTITION_END);
+
+#if defined(CONFIG_SOC_SERIES_NRF92) && DT_NODE_HAS_STATUS_OKAY(DT_NODELABEL(secure_storage_partition))
+/* The nRF92 replacement for the end-of-MRAM requirement; see ACCESSIBLE_MRAM_END above. */
+BUILD_ASSERT(PARTITION_ADDRESS(secure_storage_partition) >= BOOT_PARTITION_END,
+	     "Secure storage must be placed above the write protected bootloader region.");
+#endif
 CHECK_MPC_ADDRESS_ALIGNMENT("At least one primary image partition", PRIMARY_ACTIVE_0_START);
 CHECK_MPC_ADDRESS_ALIGNMENT("At least one primary image partition", PRIMARY_ACTIVE_0_END);
 CHECK_MPC_ADDRESS_ALIGNMENT("At least one primary image partition", PRIMARY_ACTIVE_1_START);
@@ -271,6 +292,54 @@ CHECK_MPC_ADDRESS_ALIGNMENT("At least one secondary image partition", SECONDARY_
  * Overrides 1 and 2 are those used by IronSide SE to give full RWX access to MRAM in the
  * default configuration - therefore overwriting those overwrites the defaults.
  */
+
+#if defined(CONFIG_SOC_SERIES_NRF92)
+
+/* IronSide SE on nRF92 validates every MPCCONF entry against an allow list, and on this part
+ * that list is overrides 4, 5, 6, 7 and 29 of MPC110 -- measured on an nRF9251 DK against
+ * IronSide SE 23.7.99-SHA:410d750+127, since no allow list ships in the SoC binary bundles.
+ * Anything else fails the boot with UICR status ERROR_CONFIG, regid UICR.MPCCONF and detail
+ * status MPCCONF_ERROR_REGISTER_NOT_PERMITTED.
+ *
+ * Only three of the five are usable here, because two are carrying grants that must survive:
+ *
+ *   Override 5 grants the application RWX over the MRAM above secure storage. Overwriting it
+ *   would remove the application's access to its own settings and DFU area.
+ *   Override 6 grants RWX over all application RAM with OWNERID 0, which is what lets the
+ *   Cellular domain reach the IPC shared-memory windows. Overwriting it breaks the modem.
+ *
+ * So 4, 7 and 29 are what these tables may use, which is exactly enough for a single image:
+ * the default R_X region, the gap between the protected region and the active image, and the
+ * tail from the active image to the start of secure storage. The inter-image gap overrides
+ * are left at their nRF54H20 indices and are unreachable here, which the BUILD_ASSERT below
+ * enforces.
+ */
+BUILD_ASSERT(MCUBOOT_IMAGE_NUMBER == 1,
+	     "On nRF92 only three MPC110 overrides are both allow-listed and free (4, 7, 29), "
+	     "which is enough for a single image only.");
+
+#define MPC110_OVERRIDE_DEFAULT_RX                       (uintptr_t)&NRF_MPC110->OVERRIDE[4]
+#define MPC110_OVERRIDE_INITIAL_END_TO_ACTIVE0_START_RWX (uintptr_t)&NRF_MPC110->OVERRIDE[29]
+#define MPC110_OVERRIDE_LAST_ACTIVE_END_TO_ACCESSIBLE_MRAM_END_RWX                                 \
+	(uintptr_t)&NRF_MPC110->OVERRIDE[7]
+
+/* Saana HAC AXI0 wires overrides 4/5/6/7/29 to master ports 0 mAXI_2_M, 1 mAX2X_APP_GD,
+ * 2 mAX2X_SEC_GD, 6 mAX2X_TDD_GD, 7 mAXONS_NN and 8 mAXONS_DSP. Bit 2 is the one IronSide SE
+ * itself uses for every override it programs: read back as 0x00000004 from overrides 4, 5 and
+ * 6 on a DK, and writes with that bit set read back unchanged. An earlier reading of the HAC
+ * table concluded port 2 was not connected and that writing it would fail with
+ * MPCCONF_ERROR_READBACK_MISMATCH; measurement disagrees.
+ */
+#define MASTERPORT_DEFAULT BIT(2)
+
+/* The Saana HAC AXI0 override table fixes OWNER = APP for overrides 4 and 29 and marks it
+ * programmable only for 6. Writing NRF_OWNER_NONE into a fixed-owner field is what IronSide
+ * SE refuses, so these entries name the application explicitly. On this part that costs
+ * nothing: the application core is the only owner these ranges are for.
+ */
+#define MPCCONF_OWNER NRF_OWNER_APPLICATION
+
+#else /* nRF54H20 */
 
 /* Override used for assigning R_X perms as a default. */
 #define MPC110_OVERRIDE_DEFAULT_RX (uintptr_t)&NRF_MPC110->OVERRIDE[1]
@@ -304,6 +373,10 @@ CHECK_MPC_ADDRESS_ALIGNMENT("At least one secondary image partition", SECONDARY_
 
 /* Default masterport settings for the above MPC110 overrides. */
 #define MASTERPORT_DEFAULT (BIT(2) | BIT(3) | BIT(6))
+
+#define MPCCONF_OWNER NRF_OWNER_NONE
+
+#endif /* CONFIG_SOC_SERIES_NRF92 */
 
 /* The 3 (2 if !DIRECT_XIP) tables below this implement the access permissions at the different
  * stages of the boot:
@@ -345,7 +418,7 @@ static const struct mpcconf_entry uicr_entries[] __used Z_GENERIC_DOT_SECTION(mp
 		MPCCONF_ENTRY_CONFIG1_VALUE(/* R */ true, /* W */ false,
 					    /* X */ true,
 					    /* S */ false, ACCESSIBLE_MRAM_START),
-		MPCCONF_ENTRY_CONFIG2_VALUE(NRF_OWNER_NONE, BOOT_PARTITION_END),
+		MPCCONF_ENTRY_CONFIG2_VALUE(MPCCONF_OWNER, BOOT_PARTITION_END),
 		MPCCONF_ENTRY_CONFIG3_VALUE(MASTERPORT_DEFAULT),
 	},
 
@@ -358,7 +431,7 @@ static const struct mpcconf_entry uicr_entries[] __used Z_GENERIC_DOT_SECTION(mp
 		MPCCONF_ENTRY_CONFIG1_VALUE(/* R */ true, /* W */ true,
 					    /* X */ false,
 					    /* S */ false, BOOT_PARTITION_END),
-		MPCCONF_ENTRY_CONFIG2_VALUE(NRF_OWNER_NONE, ACCESSIBLE_MRAM_END),
+		MPCCONF_ENTRY_CONFIG2_VALUE(MPCCONF_OWNER, ACCESSIBLE_MRAM_END),
 		MPCCONF_ENTRY_CONFIG3_VALUE(MASTERPORT_DEFAULT),
 	},
 #endif
@@ -404,7 +477,7 @@ static const struct mpcconf_entry primary_entries[] = {
 		MPCCONF_ENTRY_CONFIG1_VALUE(/* R */ true, /* W */ false,
 					    /* X */ true,
 					    /* S */ false, ACCESSIBLE_MRAM_START),
-		MPCCONF_ENTRY_CONFIG2_VALUE(NRF_OWNER_NONE, ACCESSIBLE_MRAM_END),
+		MPCCONF_ENTRY_CONFIG2_VALUE(MPCCONF_OWNER, ACCESSIBLE_MRAM_END),
 		MPCCONF_ENTRY_CONFIG3_VALUE(MASTERPORT_DEFAULT),
 	},
 
@@ -416,7 +489,7 @@ static const struct mpcconf_entry primary_entries[] = {
 		MPCCONF_ENTRY_CONFIG1_VALUE(/* R */ true, /* W */ true,
 					    /* X */ true,
 					    /* S */ false, BOOT_PARTITION_END),
-		MPCCONF_ENTRY_CONFIG2_VALUE(NRF_OWNER_NONE, PRIMARY_ACTIVE_0_START),
+		MPCCONF_ENTRY_CONFIG2_VALUE(MPCCONF_OWNER, PRIMARY_ACTIVE_0_START),
 		MPCCONF_ENTRY_CONFIG3_VALUE(MASTERPORT_DEFAULT),
 	},
 #endif
@@ -430,7 +503,7 @@ static const struct mpcconf_entry primary_entries[] = {
 		MPCCONF_ENTRY_CONFIG1_VALUE(/* R */ true, /* W */ true,
 					    /* X */ true,
 					    /* S */ false, PRIMARY_ACTIVE_0_END),
-		MPCCONF_ENTRY_CONFIG2_VALUE(NRF_OWNER_NONE, PRIMARY_ACTIVE_1_START),
+		MPCCONF_ENTRY_CONFIG2_VALUE(MPCCONF_OWNER, PRIMARY_ACTIVE_1_START),
 		MPCCONF_ENTRY_CONFIG3_VALUE(MASTERPORT_DEFAULT),
 	},
 #endif
@@ -445,7 +518,7 @@ static const struct mpcconf_entry primary_entries[] = {
 		MPCCONF_ENTRY_CONFIG1_VALUE(/* R */ true, /* W */ true,
 					    /* X */ true,
 					    /* S */ false, PRIMARY_ACTIVE_1_END),
-		MPCCONF_ENTRY_CONFIG2_VALUE(NRF_OWNER_NONE, PRIMARY_ACTIVE_2_START),
+		MPCCONF_ENTRY_CONFIG2_VALUE(MPCCONF_OWNER, PRIMARY_ACTIVE_2_START),
 		MPCCONF_ENTRY_CONFIG3_VALUE(MASTERPORT_DEFAULT),
 	},
 #endif
@@ -460,7 +533,7 @@ static const struct mpcconf_entry primary_entries[] = {
 		MPCCONF_ENTRY_CONFIG1_VALUE(/* R */ true, /* W */ true,
 					    /* X */ true,
 					    /* S */ false, PRIMARY_ACTIVE_2_END),
-		MPCCONF_ENTRY_CONFIG2_VALUE(NRF_OWNER_NONE, PRIMARY_ACTIVE_3_START),
+		MPCCONF_ENTRY_CONFIG2_VALUE(MPCCONF_OWNER, PRIMARY_ACTIVE_3_START),
 		MPCCONF_ENTRY_CONFIG3_VALUE(MASTERPORT_DEFAULT),
 	},
 #endif
@@ -475,7 +548,7 @@ static const struct mpcconf_entry primary_entries[] = {
 		MPCCONF_ENTRY_CONFIG1_VALUE(/* R */ true, /* W */ true,
 					    /* X */ true,
 					    /* S */ false, PRIMARY_ACTIVE_3_END),
-		MPCCONF_ENTRY_CONFIG2_VALUE(NRF_OWNER_NONE, ACCESSIBLE_MRAM_END),
+		MPCCONF_ENTRY_CONFIG2_VALUE(MPCCONF_OWNER, ACCESSIBLE_MRAM_END),
 		MPCCONF_ENTRY_CONFIG3_VALUE(MASTERPORT_DEFAULT),
 	},
 #endif
@@ -490,7 +563,7 @@ static const struct mpcconf_entry secondary_entries[] = {
 		MPCCONF_ENTRY_CONFIG1_VALUE(/* R */ true, /* W */ false,
 					    /* X */ true,
 					    /* S */ false, ACCESSIBLE_MRAM_START),
-		MPCCONF_ENTRY_CONFIG2_VALUE(NRF_OWNER_NONE, ACCESSIBLE_MRAM_END),
+		MPCCONF_ENTRY_CONFIG2_VALUE(MPCCONF_OWNER, ACCESSIBLE_MRAM_END),
 		MPCCONF_ENTRY_CONFIG3_VALUE(MASTERPORT_DEFAULT),
 	},
 
@@ -502,7 +575,7 @@ static const struct mpcconf_entry secondary_entries[] = {
 		MPCCONF_ENTRY_CONFIG1_VALUE(/* R */ true, /* W */ true,
 					    /* X */ true,
 					    /* S */ false, BOOT_PARTITION_END),
-		MPCCONF_ENTRY_CONFIG2_VALUE(NRF_OWNER_NONE, SECONDARY_ACTIVE_0_START),
+		MPCCONF_ENTRY_CONFIG2_VALUE(MPCCONF_OWNER, SECONDARY_ACTIVE_0_START),
 		MPCCONF_ENTRY_CONFIG3_VALUE(MASTERPORT_DEFAULT),
 	},
 #endif
@@ -516,7 +589,7 @@ static const struct mpcconf_entry secondary_entries[] = {
 		MPCCONF_ENTRY_CONFIG1_VALUE(
 			/* R */ true, /* W */ true, /* X */ true,
 			/* S */ false, SECONDARY_ACTIVE_0_END),
-		MPCCONF_ENTRY_CONFIG2_VALUE(NRF_OWNER_NONE, SECONDARY_ACTIVE_1_START),
+		MPCCONF_ENTRY_CONFIG2_VALUE(MPCCONF_OWNER, SECONDARY_ACTIVE_1_START),
 		MPCCONF_ENTRY_CONFIG3_VALUE(MASTERPORT_DEFAULT),
 	},
 #endif
@@ -531,7 +604,7 @@ static const struct mpcconf_entry secondary_entries[] = {
 		MPCCONF_ENTRY_CONFIG1_VALUE(
 			/* R */ true, /* W */ true, /* X */ true,
 			/* S */ false, SECONDARY_ACTIVE_1_END),
-		MPCCONF_ENTRY_CONFIG2_VALUE(NRF_OWNER_NONE, SECONDARY_ACTIVE_2_START),
+		MPCCONF_ENTRY_CONFIG2_VALUE(MPCCONF_OWNER, SECONDARY_ACTIVE_2_START),
 		MPCCONF_ENTRY_CONFIG3_VALUE(MASTERPORT_DEFAULT),
 	},
 #endif
@@ -546,7 +619,7 @@ static const struct mpcconf_entry secondary_entries[] = {
 		MPCCONF_ENTRY_CONFIG1_VALUE(
 			/* R */ true, /* W */ true, /* X */ true,
 			/* S */ false, SECONDARY_ACTIVE_2_END),
-		MPCCONF_ENTRY_CONFIG2_VALUE(NRF_OWNER_NONE, SECONDARY_ACTIVE_3_START),
+		MPCCONF_ENTRY_CONFIG2_VALUE(MPCCONF_OWNER, SECONDARY_ACTIVE_3_START),
 		MPCCONF_ENTRY_CONFIG3_VALUE(MASTERPORT_DEFAULT),
 	},
 #endif
@@ -561,7 +634,7 @@ static const struct mpcconf_entry secondary_entries[] = {
 		MPCCONF_ENTRY_CONFIG1_VALUE(/* R */ true, /* W */ true,
 					    /* X */ true,
 					    /* S */ false, SECONDARY_ACTIVE_3_END),
-		MPCCONF_ENTRY_CONFIG2_VALUE(NRF_OWNER_NONE, ACCESSIBLE_MRAM_END),
+		MPCCONF_ENTRY_CONFIG2_VALUE(MPCCONF_OWNER, ACCESSIBLE_MRAM_END),
 		MPCCONF_ENTRY_CONFIG3_VALUE(MASTERPORT_DEFAULT),
 	},
 #endif
